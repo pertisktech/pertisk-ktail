@@ -153,11 +153,6 @@ impl Controller {
         }
     }
 
-    async fn on_update(&self, pod: &Arc<Pod>) {
-        // Similar to on_add - tail any new containers
-        self.on_add(pod).await;
-    }
-
     async fn on_delete(&self, pod: &Arc<Pod>) {
         if let Some(spec) = &pod.spec {
             for container in &spec.containers {
