@@ -89,6 +89,8 @@ const VERSION: &str = "0.1.0";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    use chrono::Utc;
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -148,7 +150,7 @@ async fn main() -> Result<()> {
         Arc::new(OrMatcher(matchers))
     } else {
         // Match nothing if no excludes specified
-        Arc::new(RegexMatcher::new("(?!)").unwrap())
+        Arc::new(RegexMatcher::new(r"\b\B")?)
     };
 
     // Parse since duration
@@ -157,7 +159,7 @@ async fn main() -> Result<()> {
     } else if let Some(since_str) = &args.since {
         parse_since(since_str)?
     } else {
-        None
+        Some(Utc::now())
     };
 
     // Create output formatter

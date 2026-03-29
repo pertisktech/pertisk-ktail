@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 #[derive(Debug, Clone)]
 pub struct LogEvent {
@@ -65,7 +66,9 @@ impl ContainerTailer {
             match self.get_stream().await {
                 Ok(stream) => {
                     if let Err(e) = self.run_stream(stream, on_event.clone()).await {
-                        on_error(e);
+                        if !Self::is_transient_stream_error(&e) {
+                            on_error(e);
+                        }
                         let backoff = self.calculate_backoff();
                         tokio::time::sleep(backoff).await;
                         self.retry_count += 1;
@@ -75,7 +78,9 @@ impl ContainerTailer {
                     self.state = TailState::Recover;
                 }
                 Err(e) => {
-                    on_error(e);
+                    if !Self::is_transient_stream_error(&e) {
+                        on_error(e);
+                    }
                     let backoff = self.calculate_backoff();
                     tokio::time::sleep(backoff).await;
                     self.retry_count += 1;
@@ -106,21 +111,19 @@ impl ContainerTailer {
             .ok_or(anyhow::anyhow!("No namespace"))?;
 
         let pods = kube::Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let _logs = pods
+        let logs = pods
             .log_stream(
                 pod_name,
                 &kube::api::LogParams {
                     container: Some(self.container.name.clone()),
                     follow: true,
+                    since_time: self.from_timestamp,
                     ..Default::default()
                 },
             )
             .await?;
 
-        // Placeholder: return empty stream for now
-        // In production, you'd need to properly convert the kube-rs stream
-        let empty: Box<dyn AsyncRead + Unpin + Send> = Box::new(tokio::io::empty());
-        Ok(empty)
+        Ok(Box::new(logs.compat()))
     }
 
     async fn run_stream<E>(&mut self, stream: Box<dyn AsyncRead + Unpin + Send>, on_event: E) -> Result<()>
@@ -147,18 +150,17 @@ impl ContainerTailer {
             return;
         }
 
-        // Parse timestamp and message
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() < 2 {
-            return;
-        }
-
-        let timestamp_str = parts[0];
-        let message = parts[1];
-
-        let timestamp = DateTime::parse_from_rfc3339(timestamp_str)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc));
+        // Parse optional RFC3339 timestamp prefix. If not present, keep the full line.
+        let (timestamp, message) = match line.split_once(' ') {
+            Some((head, rest)) => {
+                if let Ok(ts) = DateTime::parse_from_rfc3339(head) {
+                    (Some(ts.with_timezone(&Utc)), rest)
+                } else {
+                    (None, line)
+                }
+            }
+            None => (None, line),
+        };
 
         let checksum = Self::checksum_line(message);
 
@@ -193,5 +195,13 @@ impl ContainerTailer {
         let mut hasher = Sha256::new();
         hasher.update(line.as_bytes());
         hasher.finalize().to_vec()
+    }
+
+    fn is_transient_stream_error(error: &anyhow::Error) -> bool {
+        let msg = error.to_string().to_ascii_lowercase();
+        msg.contains("error reading a body from connection")
+            || msg.contains("connection closed")
+            || msg.contains("broken pipe")
+            || msg.contains("connection reset")
     }
 }

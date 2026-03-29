@@ -182,18 +182,26 @@ impl Controller {
         let container_name = container.name.clone();
         let tailer_id = format!("{}/{}", pod_name, container_name);
 
+        {
+            let tailers = self.tailers.read().await;
+            if tailers.contains_key(&tailer_id) {
+                return;
+            }
+        }
+
         let client = self.client.clone();
         let pod_clone = pod.clone();
         let container_clone = container.clone();
         let on_event = self.callbacks.on_event.clone();
         let on_error = self.callbacks.on_error.clone();
+        let from_timestamp = self.options.since;
 
         let handle = tokio::spawn(async move {
             let mut tailer = ContainerTailer::new(
                 client,
                 pod_clone.as_ref().clone(),
                 container_clone.as_ref().clone(),
-                None,
+                from_timestamp,
             );
 
             let event_callback = |event: LogEvent| {
