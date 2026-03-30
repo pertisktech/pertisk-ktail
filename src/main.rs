@@ -80,8 +80,8 @@ struct Args {
     #[arg(long, default_value = "auto")]
     color: String,
 
-    /// Set color scheme
-    #[arg(long, default_value = "bw")]
+    /// Set color scheme: modern, bw
+    #[arg(long, default_value = "modern", value_parser = ["modern", "bw"])]
     color_scheme: String,
 }
 

@@ -72,6 +72,9 @@ ktail '^frontend'
 # Tail with label selector
 ktail -l app=myapp
 
+# Use modern color theme
+ktail --color-scheme modern
+
 # All options
 ktail --help
 ```
@@ -85,11 +88,16 @@ quiet: false
 noColor: false
 raw: false
 timestamps: false
-colorScheme: bw
+colorScheme: modern
 colorMode: auto
 kubeConfigPath: ""
 templateString: ""
 ```
+
+Supported color schemes:
+
+- `modern` (default): semantic highlighting for severity, status, HTTP method, and JSON keys
+- `bw`: classic/basic colors
 
 ## Development
 

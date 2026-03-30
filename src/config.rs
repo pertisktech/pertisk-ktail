@@ -27,7 +27,7 @@ fn default_color_mode() -> String {
 }
 
 fn default_color_scheme() -> String {
-    "bw".to_string()
+    "modern".to_string()
 }
 
 impl Default for Config {
@@ -38,7 +38,7 @@ impl Default for Config {
             raw: false,
             timestamps: false,
             color_mode: "auto".to_string(),
-            color_scheme: "bw".to_string(),
+            color_scheme: "modern".to_string(),
             template_string: String::new(),
             kube_config_path: String::new(),
         }

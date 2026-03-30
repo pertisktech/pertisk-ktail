@@ -72,11 +72,19 @@ impl OutputFormatter {
         let mut output = String::new();
 
         if should_colorize && !self.no_color {
-            output.push_str(&format!(
-                "{}:{} ",
-                pod_name.cyan(),
-                workload_name.yellow()
-            ));
+            if self.is_modern_scheme() {
+                output.push_str(&format!(
+                    "{}:{} ",
+                    pod_name.bright_blue().bold(),
+                    workload_name.bright_yellow()
+                ));
+            } else {
+                output.push_str(&format!(
+                    "{}:{} ",
+                    pod_name.cyan(),
+                    workload_name.yellow()
+                ));
+            }
         } else {
             output.push_str(&format!("{}:{} ", pod_name, workload_name));
         }
@@ -140,9 +148,14 @@ impl OutputFormatter {
                 let items: Vec<String> = map
                     .iter()
                     .map(|(k, v)| {
+                        let key = if self.is_modern_scheme() {
+                            k.bright_cyan().to_string()
+                        } else {
+                            k.cyan().to_string()
+                        };
                         format!(
                             "\"{}\":{}",
-                            k.cyan(),
+                            key,
                             self.colorize_json(v, Some(k))
                         )
                     })
@@ -158,7 +171,13 @@ impl OutputFormatter {
             }
             serde_json::Value::String(s) => self.colorize_json_string(s, parent_key),
             serde_json::Value::Number(n) => self.colorize_json_number(n, parent_key),
-            serde_json::Value::Bool(b) => b.to_string().magenta().to_string(),
+            serde_json::Value::Bool(b) => {
+                if self.is_modern_scheme() {
+                    b.to_string().bright_magenta().to_string()
+                } else {
+                    b.to_string().magenta().to_string()
+                }
+            }
             serde_json::Value::Null => "null".bright_black().to_string(),
         }
     }
@@ -170,7 +189,32 @@ impl OutputFormatter {
             }
         }
 
-        format!("\"{}\"", value.green())
+        let key = parent_key.unwrap_or_default().to_ascii_lowercase();
+
+        if Self::is_severity_key(parent_key) {
+            return format!("\"{}\"", self.colorize_severity(value));
+        }
+        if key == "method" {
+            return format!("\"{}\"", self.colorize_http_method(value));
+        }
+        if key.contains("path") || key == "url" {
+            if self.is_modern_scheme() {
+                return format!("\"{}\"", value.bright_cyan());
+            }
+            return format!("\"{}\"", value.bright_cyan());
+        }
+        if key == "msg" || key == "message" {
+            if self.is_modern_scheme() {
+                return format!("\"{}\"", value.bright_white());
+            }
+            return format!("\"{}\"", value.white());
+        }
+
+        if self.is_modern_scheme() {
+            format!("\"{}\"", value.bright_green())
+        } else {
+            format!("\"{}\"", value.green())
+        }
     }
 
     fn colorize_json_number(&self, value: &serde_json::Number, parent_key: Option<&str>) -> String {
@@ -180,7 +224,118 @@ impl OutputFormatter {
             }
         }
 
-        value.to_string().blue().to_string()
+        if self.is_modern_scheme() {
+            value.to_string().bright_blue().to_string()
+        } else {
+            value.to_string().blue().to_string()
+        }
+    }
+
+    fn is_modern_scheme(&self) -> bool {
+        self.color_scheme.eq_ignore_ascii_case("modern")
+    }
+
+    fn is_severity_key(parent_key: Option<&str>) -> bool {
+        matches!(
+            parent_key.map(|key| key.to_ascii_lowercase()),
+            Some(key) if key == "level" || key == "severity" || key == "log_level"
+        )
+    }
+
+    fn colorize_severity(&self, level: &str) -> String {
+        let level_upper = level.to_ascii_uppercase();
+        match level_upper.as_str() {
+            "TRACE" => {
+                if self.is_modern_scheme() {
+                    level.bright_black().to_string()
+                } else {
+                    level.bright_black().to_string()
+                }
+            }
+            "DEBUG" => {
+                if self.is_modern_scheme() {
+                    level.bright_cyan().to_string()
+                } else {
+                    level.cyan().to_string()
+                }
+            }
+            "INFO" => {
+                if self.is_modern_scheme() {
+                    level.bright_green().bold().to_string()
+                } else {
+                    level.green().to_string()
+                }
+            }
+            "WARN" | "WARNING" => {
+                if self.is_modern_scheme() {
+                    level.bright_yellow().bold().to_string()
+                } else {
+                    level.yellow().bold().to_string()
+                }
+            }
+            "ERROR" | "ERR" => {
+                if self.is_modern_scheme() {
+                    level.bright_red().bold().to_string()
+                } else {
+                    level.red().bold().to_string()
+                }
+            }
+            "FATAL" | "PANIC" => {
+                if self.is_modern_scheme() {
+                    level.bright_red().on_black().bold().to_string()
+                } else {
+                    level.red().on_black().bold().to_string()
+                }
+            }
+            _ => {
+                if self.is_modern_scheme() {
+                    level.bright_white().to_string()
+                } else {
+                    level.white().to_string()
+                }
+            }
+        }
+    }
+
+    fn colorize_http_method(&self, method: &str) -> String {
+        let m = method.to_ascii_uppercase();
+        match m.as_str() {
+            "GET" => {
+                if self.is_modern_scheme() {
+                    method.bright_cyan().bold().to_string()
+                } else {
+                    method.cyan().bold().to_string()
+                }
+            }
+            "POST" => {
+                if self.is_modern_scheme() {
+                    method.bright_green().bold().to_string()
+                } else {
+                    method.green().bold().to_string()
+                }
+            }
+            "PUT" | "PATCH" => {
+                if self.is_modern_scheme() {
+                    method.bright_yellow().bold().to_string()
+                } else {
+                    method.yellow().bold().to_string()
+                }
+            }
+            "DELETE" => {
+                if self.is_modern_scheme() {
+                    method.bright_red().bold().to_string()
+                } else {
+                    method.red().bold().to_string()
+                }
+            }
+            _ => {
+                if self.is_modern_scheme() {
+                    method.bright_blue().to_string()
+                } else {
+                    method.blue().to_string()
+                }
+            }
+        }
     }
 
     fn is_http_status_key(parent_key: Option<&str>) -> bool {
@@ -198,13 +353,24 @@ impl OutputFormatter {
     }
 
     fn colorize_http_status(&self, status: u16) -> String {
-        match status {
-            100..=199 => status.to_string().cyan().to_string(),
-            200..=299 => status.to_string().green().bold().to_string(),
-            300..=399 => status.to_string().yellow().to_string(),
-            400..=499 => status.to_string().bright_red().to_string(),
-            500..=599 => status.to_string().red().bold().to_string(),
-            _ => status.to_string().blue().to_string(),
+        if self.is_modern_scheme() {
+            match status {
+                100..=199 => status.to_string().bright_cyan().to_string(),
+                200..=299 => status.to_string().bright_green().bold().to_string(),
+                300..=399 => status.to_string().bright_yellow().to_string(),
+                400..=499 => status.to_string().yellow().bold().to_string(),
+                500..=599 => status.to_string().bright_red().bold().to_string(),
+                _ => status.to_string().bright_blue().to_string(),
+            }
+        } else {
+            match status {
+                100..=199 => status.to_string().cyan().to_string(),
+                200..=299 => status.to_string().green().bold().to_string(),
+                300..=399 => status.to_string().yellow().to_string(),
+                400..=499 => status.to_string().bright_red().to_string(),
+                500..=599 => status.to_string().red().bold().to_string(),
+                _ => status.to_string().blue().to_string(),
+            }
         }
     }
 
