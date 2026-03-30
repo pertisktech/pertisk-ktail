@@ -44,9 +44,11 @@ impl Controller {
         }
     }
 
-    pub async fn run(&self, token: tokio_util::sync::CancellationToken) -> Result<()> {
+    pub async fn run(self: Arc<Self>, token: tokio_util::sync::CancellationToken) -> Result<()> {
         let mut discovered_any = false;
+        let mut inaccessible_namespaces = std::collections::HashSet::new();
 
+        // Initial discovery across all namespaces
         for namespace in &self.options.namespaces {
             let actual_namespace = if namespace == "*" {
                 None
@@ -60,7 +62,6 @@ impl Controller {
                 kube::Api::<Pod>::all(self.client.clone())
             };
 
-            // Initial discovery
             match api.list(&Default::default()).await {
                 Ok(pod_list) => {
                     for pod in pod_list.items {
@@ -70,35 +71,12 @@ impl Controller {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to list pods: {}", e);
-                }
-            }
-
-            // Watch for changes
-            let mut stream = watcher(api, Default::default()).boxed();
-
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    result = stream.next() => {
-                        match result {
-                            Some(Ok(event)) => {
-                                use kube::runtime::watcher::Event;
-                                match event {
-                                    Event::Apply(pod) => {
-                                        self.on_add(&Arc::new(pod)).await;
-                                    }
-                                    Event::Delete(pod) => {
-                                        self.on_delete(&Arc::new(pod)).await;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Some(Err(e)) => {
-                                eprintln!("Watcher error: {}", e);
-                            }
-                            None => break,
-                        }
+                    let error_str = e.to_string();
+                    if error_str.contains("forbidden") || error_str.contains("Forbidden") || error_str.contains("403") {
+                        eprintln!("Permission denied for namespace '{}' - skipping", namespace);
+                        inaccessible_namespaces.insert(namespace.clone());
+                    } else {
+                        eprintln!("Failed to list pods in namespace {}: {}", namespace, e);
                     }
                 }
             }
@@ -107,6 +85,71 @@ impl Controller {
         if !discovered_any {
             (self.callbacks.on_nothing_discovered)();
         }
+
+        // Watch all accessible namespaces concurrently
+        let mut watch_tasks = vec![];
+        for namespace in &self.options.namespaces {
+            // Skip namespaces that were inaccessible during discovery
+            if inaccessible_namespaces.contains(namespace) {
+                continue;
+            }
+
+            let actual_namespace = if namespace == "*" {
+                None
+            } else {
+                Some(namespace.clone())
+            };
+
+            let api = if let Some(ns) = actual_namespace {
+                kube::Api::<Pod>::namespaced(self.client.clone(), &ns)
+            } else {
+                kube::Api::<Pod>::all(self.client.clone())
+            };
+
+            let token_clone = token.clone();
+            let self_clone = self.clone();
+            let namespace_clone = namespace.clone();
+            
+            let task = tokio::spawn(async move {
+                let mut stream = watcher(api, Default::default()).boxed();
+                loop {
+                    tokio::select! {
+                        _ = token_clone.cancelled() => break,
+                        result = stream.next() => {
+                            match result {
+                                Some(Ok(event)) => {
+                                    use kube::runtime::watcher::Event;
+                                    match event {
+                                        Event::Apply(pod) => {
+                                            self_clone.on_add(&Arc::new(pod)).await;
+                                        }
+                                        Event::Delete(pod) => {
+                                            self_clone.on_delete(&Arc::new(pod)).await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    let error_str = e.to_string();
+                                    if error_str.contains("forbidden") || error_str.contains("Forbidden") || error_str.contains("403") {
+                                        eprintln!("Permission denied for namespace '{}' - stopping watch", namespace_clone);
+                                        break;
+                                    } else {
+                                        eprintln!("Watcher error in namespace '{}': {}", namespace_clone, e);
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            });
+            watch_tasks.push(task);
+        }
+
+        // Wait for cancellation signal instead of waiting for watch tasks to complete
+        // The tailers will continue streaming logs in the background
+        token.cancelled().await;
 
         Ok(())
     }

@@ -36,9 +36,9 @@ struct Args {
     #[arg(short, long)]
     exclude: Vec<String>,
 
-    /// Match pods by label selector
-    #[arg(short = 'l', long)]
-    selector: Option<String>,
+    /// Match pods by label selector (can be repeated)
+    #[arg(short = 'l', long, action = clap::ArgAction::Append)]
+    selector: Vec<String>,
 
     /// Start reading log from the beginning
     #[arg(long)]
@@ -132,10 +132,14 @@ async fn main() -> Result<()> {
             matchers.push(Box::new(RegexMatcher::new(pattern)?));
         }
         Arc::new(OrMatcher(matchers))
-    } else if let Some(selector) = &args.selector {
-        // Parse label selector
-        let labels = parse_label_selector(selector)?;
-        Arc::new(LabelSelectorMatcher::new(labels))
+    } else if !args.selector.is_empty() {
+        // Parse label selectors (combine multiple with OR)
+        let mut matchers: Vec<Box<dyn Matcher>> = Vec::new();
+        for selector in &args.selector {
+            let labels = parse_label_selector(selector)?;
+            matchers.push(Box::new(LabelSelectorMatcher::new(labels)));
+        }
+        Arc::new(OrMatcher(matchers))
     } else {
         // Match all if no patterns specified
         Arc::new(RegexMatcher::new(".*")?)
@@ -228,7 +232,7 @@ async fn main() -> Result<()> {
     };
 
     // Create and run controller
-    let controller = Controller::new(client, options, callbacks);
+    let controller = std::sync::Arc::new(Controller::new(client, options, callbacks));
 
     // Setup Ctrl+C handler
     let token = CancellationToken::new();
