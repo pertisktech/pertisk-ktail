@@ -66,8 +66,13 @@ impl ContainerTailer {
             match self.get_stream().await {
                 Ok(stream) => {
                     if let Err(e) = self.run_stream(stream, on_event.clone()).await {
+                        let is_not_found = Self::is_pod_not_found(&e);
                         if !Self::is_transient_stream_error(&e) {
                             on_error(e);
+                            // If pod is not found, stop retrying - it's permanently gone
+                            if is_not_found {
+                                break;
+                            }
                         }
                         let backoff = self.calculate_backoff();
                         tokio::time::sleep(backoff).await;
@@ -78,8 +83,13 @@ impl ContainerTailer {
                     self.state = TailState::Recover;
                 }
                 Err(e) => {
+                    let is_not_found = Self::is_pod_not_found(&e);
                     if !Self::is_transient_stream_error(&e) {
                         on_error(e);
+                        // If pod is not found, stop retrying - it's permanently gone
+                        if is_not_found {
+                            break;
+                        }
                     }
                     let backoff = self.calculate_backoff();
                     tokio::time::sleep(backoff).await;
@@ -203,5 +213,12 @@ impl ContainerTailer {
             || msg.contains("connection closed")
             || msg.contains("broken pipe")
             || msg.contains("connection reset")
+    }
+
+    fn is_pod_not_found(error: &anyhow::Error) -> bool {
+        let msg = error.to_string();
+        msg.contains("not found") && msg.contains("404")
+            || msg.contains("pods") && msg.contains("not found")
+            || msg.contains("NotFound")
     }
 }
