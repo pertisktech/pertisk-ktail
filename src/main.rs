@@ -37,11 +37,11 @@ struct Args {
     exclude: Vec<String>,
 
     /// Match pods by label selector
-    #[arg(short, long)]
+    #[arg(short = 'l', long)]
     selector: Option<String>,
 
     /// Start reading log from the beginning
-    #[arg(short, long)]
+    #[arg(long)]
     since_start: bool,
 
     /// Get logs since a given time or duration (e.g., 2023-03-30 or 1h)

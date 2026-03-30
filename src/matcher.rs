@@ -58,9 +58,10 @@ impl Matcher for LabelSelectorMatcher {
         }
     }
 
-    fn matches_container(&self, _pod: &Pod, _container: &Container) -> bool {
+    fn matches_container(&self, pod: &Pod, _container: &Container) -> bool {
         // Label selectors apply to pods, not individual containers
-        false
+        // So check the pod's labels
+        self.matches_pod(pod)
     }
 }
 
