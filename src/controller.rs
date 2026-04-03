@@ -198,7 +198,23 @@ impl Controller {
 
     async fn on_delete(&self, pod: &Arc<Pod>) {
         if let Some(spec) = &pod.spec {
+            if let Some(init_containers) = &spec.init_containers {
+                for container in init_containers {
+                    let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+                    let tailer_id = format!("{}/{}", pod_name, container.name);
+                    if let Some(handle) = self.tailers.write().await.remove(&tailer_id) {
+                        handle.abort();
+                    }
+                    (self.callbacks.on_exit)(pod, &Arc::new(container.clone()));
+                }
+            }
+
             for container in &spec.containers {
+                let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+                let tailer_id = format!("{}/{}", pod_name, container.name);
+                if let Some(handle) = self.tailers.write().await.remove(&tailer_id) {
+                    handle.abort();
+                }
                 (self.callbacks.on_exit)(pod, &Arc::new(container.clone()));
             }
         }
@@ -238,6 +254,8 @@ impl Controller {
         let on_event = self.callbacks.on_event.clone();
         let on_error = self.callbacks.on_error.clone();
         let from_timestamp = self.options.since;
+        let tailers = self.tailers.clone();
+        let tailer_id_for_cleanup = tailer_id.clone();
 
         let handle = tokio::spawn(async move {
             let mut tailer = ContainerTailer::new(
@@ -256,6 +274,9 @@ impl Controller {
             };
 
             let _ = tailer.run(event_callback, error_callback).await;
+
+            // Remove completed tailer so future pod/container instances can be tailed.
+            tailers.write().await.remove(&tailer_id_for_cleanup);
         });
 
         self.tailers.write().await.insert(tailer_id, handle);
