@@ -213,6 +213,9 @@ impl ContainerTailer {
             || msg.contains("connection closed")
             || msg.contains("broken pipe")
             || msg.contains("connection reset")
+            // Kubernetes may return 400 BadRequest while a container is still starting.
+            || msg.contains("containercreating")
+            || msg.contains("is waiting to start")
     }
 
     fn is_pod_not_found(error: &anyhow::Error) -> bool {

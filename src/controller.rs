@@ -231,54 +231,54 @@ impl Controller {
     }
 
     async fn add_container(&self, pod: &Arc<Pod>, container: &Arc<Container>, initial_add: bool) {
-        let should_tail = (self.callbacks.on_enter)(pod, container, initial_add);
-        
-        if !should_tail {
-            return;
-        }
-
         let pod_name = pod.metadata.name.as_ref().map(|s| s.clone()).unwrap_or_default();
         let container_name = container.name.clone();
         let tailer_id = format!("{}/{}", pod_name, container_name);
 
+        // Keep callback+insert atomic under one lock to avoid duplicate starts from rapid Apply events.
         {
-            let tailers = self.tailers.read().await;
+            let mut tailers = self.tailers.write().await;
             if tailers.contains_key(&tailer_id) {
                 return;
             }
+
+            let should_tail = (self.callbacks.on_enter)(pod, container, initial_add);
+            if !should_tail {
+                return;
+            }
+
+            let client = self.client.clone();
+            let pod_clone = pod.clone();
+            let container_clone = container.clone();
+            let on_event = self.callbacks.on_event.clone();
+            let on_error = self.callbacks.on_error.clone();
+            let from_timestamp = self.options.since;
+            let tailers_map = self.tailers.clone();
+            let tailer_id_for_cleanup = tailer_id.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut tailer = ContainerTailer::new(
+                    client,
+                    pod_clone.as_ref().clone(),
+                    container_clone.as_ref().clone(),
+                    from_timestamp,
+                );
+
+                let event_callback = |event: LogEvent| {
+                    on_event(event);
+                };
+
+                let error_callback = |e: anyhow::Error| {
+                    on_error(&pod_clone, &container_clone, &e);
+                };
+
+                let _ = tailer.run(event_callback, error_callback).await;
+
+                // Remove completed tailer so future pod/container instances can be tailed.
+                tailers_map.write().await.remove(&tailer_id_for_cleanup);
+            });
+
+            tailers.insert(tailer_id, handle);
         }
-
-        let client = self.client.clone();
-        let pod_clone = pod.clone();
-        let container_clone = container.clone();
-        let on_event = self.callbacks.on_event.clone();
-        let on_error = self.callbacks.on_error.clone();
-        let from_timestamp = self.options.since;
-        let tailers = self.tailers.clone();
-        let tailer_id_for_cleanup = tailer_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let mut tailer = ContainerTailer::new(
-                client,
-                pod_clone.as_ref().clone(),
-                container_clone.as_ref().clone(),
-                from_timestamp,
-            );
-
-            let event_callback = |event: LogEvent| {
-                on_event(event);
-            };
-
-            let error_callback = |e: anyhow::Error| {
-                on_error(&pod_clone, &container_clone, &e);
-            };
-
-            let _ = tailer.run(event_callback, error_callback).await;
-
-            // Remove completed tailer so future pod/container instances can be tailed.
-            tailers.write().await.remove(&tailer_id_for_cleanup);
-        });
-
-        self.tailers.write().await.insert(tailer_id, handle);
     }
 }
