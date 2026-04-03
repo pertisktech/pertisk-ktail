@@ -216,6 +216,7 @@ impl ContainerTailer {
             // Kubernetes may return 400 BadRequest while a container is still starting.
             || msg.contains("containercreating")
             || msg.contains("is waiting to start")
+            || msg.contains("is not available")
     }
 
     fn is_pod_not_found(error: &anyhow::Error) -> bool {
