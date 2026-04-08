@@ -95,7 +95,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+                .add_directive(tracing::Level::INFO.into())
+                // Suppress per-request errors from hyper/tower internals; we surface
+                // them ourselves (or silence them when they are transient).
+                .add_directive("kube_client::client::builder=off".parse().unwrap()),
         )
         .init();
 

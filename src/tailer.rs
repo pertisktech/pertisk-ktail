@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct LogEvent {
@@ -31,6 +32,7 @@ pub struct ContainerTailer {
     stop: Arc<AtomicBool>,
     state: TailState,
     last_line_checksum: Option<Vec<u8>>,
+    last_seen_timestamp: Option<DateTime<Utc>>,
     retry_count: u32,
 }
 
@@ -49,6 +51,7 @@ impl ContainerTailer {
             stop: Arc::new(AtomicBool::new(false)),
             state: TailState::Normal,
             last_line_checksum: None,
+            last_seen_timestamp: None,
             retry_count: 0,
         }
     }
@@ -62,14 +65,21 @@ impl ContainerTailer {
         E: Fn(LogEvent) + Send + Sync + Clone,
         F: Fn(anyhow::Error) + Send + Sync + Clone,
     {
+        const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+        let pod_name = self.pod.metadata.name.clone().unwrap_or_else(|| "unknown".to_string());
+        let container_name = self.container.name.clone();
         while !self.stop.load(Ordering::SeqCst) {
+            debug!("{}/{}: polling logs (retry={})", pod_name, container_name, self.retry_count);
             match self.get_stream().await {
                 Ok(stream) => {
+                    debug!("{}/{}: stream opened, reading lines", pod_name, container_name);
                     if let Err(e) = self.run_stream(stream, on_event.clone()).await {
                         let is_not_found = Self::is_pod_not_found(&e);
-                        if !Self::is_transient_stream_error(&e) {
+                        let is_transient = Self::is_transient_stream_error(&e);
+                        warn!("{}/{}: stream error (transient={}): {}", pod_name, container_name, is_transient, e);
+                        if !is_transient {
                             on_error(e);
-                            // If pod is not found, stop retrying - it's permanently gone
                             if is_not_found {
                                 break;
                             }
@@ -78,15 +88,22 @@ impl ContainerTailer {
                         tokio::time::sleep(backoff).await;
                         self.retry_count += 1;
                     } else {
+                        debug!("{}/{}: poll complete", pod_name, container_name);
                         self.retry_count = 0;
+                        // Advance the window to avoid re-fetching already-seen lines.
+                        if let Some(ts) = self.last_seen_timestamp {
+                            self.from_timestamp = Some(ts);
+                        }
+                        self.state = TailState::Recover;
+                        tokio::time::sleep(POLL_INTERVAL).await;
                     }
-                    self.state = TailState::Recover;
                 }
                 Err(e) => {
                     let is_not_found = Self::is_pod_not_found(&e);
-                    if !Self::is_transient_stream_error(&e) {
+                    let is_transient = Self::is_transient_stream_error(&e);
+                    warn!("{}/{}: get_stream error (transient={}): {}", pod_name, container_name, is_transient, e);
+                    if !is_transient {
                         on_error(e);
-                        // If pod is not found, stop retrying - it's permanently gone
                         if is_not_found {
                             break;
                         }
@@ -121,17 +138,19 @@ impl ContainerTailer {
             .ok_or(anyhow::anyhow!("No namespace"))?;
 
         let pods = kube::Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let logs = pods
-            .log_stream(
-                pod_name,
-                &kube::api::LogParams {
-                    container: Some(self.container.name.clone()),
-                    follow: true,
-                    since_time: self.from_timestamp,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let params = kube::api::LogParams {
+            container: Some(self.container.name.clone()),
+            follow: false,
+            timestamps: true,
+            since_time: self.from_timestamp,
+            ..Default::default()
+        };
+        let logs = tokio::time::timeout(
+            Duration::from_secs(30),
+            pods.log_stream(pod_name, &params),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("log_stream connect timed out after 30s"))??;
 
         Ok(Box::new(logs.compat()))
     }
@@ -140,15 +159,23 @@ impl ContainerTailer {
     where
         E: Fn(LogEvent),
     {
+        let pod_name = self.pod.metadata.name.clone().unwrap_or_else(|| "unknown".to_string());
+        let container_name = self.container.name.clone();
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
+        let mut line_count = 0u64;
 
         while reader.read_line(&mut line).await? > 0 {
             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+            if line_count == 0 {
+                debug!("{}/{}: first line received", pod_name, container_name);
+            }
+            line_count += 1;
             self.receive_line(trimmed, &on_event);
             line.clear();
         }
 
+        debug!("{}/{}: stream EOF after {} lines", pod_name, container_name, line_count);
         Ok(())
     }
 
@@ -193,6 +220,13 @@ impl ContainerTailer {
         self.last_line_checksum = Some(checksum);
         self.state = TailState::Normal;
 
+        // Track the latest timestamp seen for advancing the poll window.
+        if let Some(ts) = timestamp {
+            if self.last_seen_timestamp.map_or(true, |prev| ts > prev) {
+                self.last_seen_timestamp = Some(ts);
+            }
+        }
+
         on_event(LogEvent {
             pod: Arc::new(self.pod.clone()),
             container: Arc::new(self.container.clone()),
@@ -209,6 +243,10 @@ impl ContainerTailer {
 
     fn is_transient_stream_error(error: &anyhow::Error) -> bool {
         let msg = error.to_string().to_ascii_lowercase();
+        // Never treat our explicit connect-timeout as transient; surface it immediately.
+        if msg.contains("log_stream connect timed out") {
+            return false;
+        }
         msg.contains("error reading a body from connection")
             || msg.contains("connection closed")
             || msg.contains("broken pipe")
@@ -217,6 +255,10 @@ impl ContainerTailer {
             || msg.contains("containercreating")
             || msg.contains("is waiting to start")
             || msg.contains("is not available")
+            // hyper/tower send-request failures (stale pooled connection, TLS re-establishment)
+            || msg.contains("sendrequest")
+            || msg.contains("connection refused")
+            || msg.contains("timed out")
     }
 
     fn is_pod_not_found(error: &anyhow::Error) -> bool {
