@@ -415,6 +415,12 @@ impl OutputFormatter {
         }
     }
 
+    pub fn print_info(&self, message: &str) {
+        if !self.quiet {
+            eprintln!("{}", message.yellow());
+        }
+    }
+
     pub fn print_error(&self, pod_name: &str, container_name: &str, error: &str) {
         eprintln!(
             "{} Error tailing {}/{}: {}",

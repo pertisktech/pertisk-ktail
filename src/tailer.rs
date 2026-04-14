@@ -77,12 +77,16 @@ impl ContainerTailer {
                     if let Err(e) = self.run_stream(stream, on_event.clone()).await {
                         let is_not_found = Self::is_pod_not_found(&e);
                         let is_transient = Self::is_transient_stream_error(&e);
-                        warn!("{}/{}: stream error (transient={}): {}", pod_name, container_name, is_transient, e);
+                        if is_not_found {
+                            debug!("{}/{}: stream ended because pod no longer exists", pod_name, container_name);
+                        } else {
+                            warn!("{}/{}: stream error (transient={}): {}", pod_name, container_name, is_transient, e);
+                        }
                         if !is_transient {
-                            on_error(e);
                             if is_not_found {
                                 break;
                             }
+                            on_error(e);
                         }
                         let backoff = self.calculate_backoff();
                         tokio::time::sleep(backoff).await;
@@ -101,12 +105,16 @@ impl ContainerTailer {
                 Err(e) => {
                     let is_not_found = Self::is_pod_not_found(&e);
                     let is_transient = Self::is_transient_stream_error(&e);
-                    warn!("{}/{}: get_stream error (transient={}): {}", pod_name, container_name, is_transient, e);
+                    if is_not_found {
+                        debug!("{}/{}: log stream closed because pod no longer exists", pod_name, container_name);
+                    } else {
+                        warn!("{}/{}: get_stream error (transient={}): {}", pod_name, container_name, is_transient, e);
+                    }
                     if !is_transient {
-                        on_error(e);
                         if is_not_found {
                             break;
                         }
+                        on_error(e);
                     }
                     let backoff = self.calculate_backoff();
                     tokio::time::sleep(backoff).await;

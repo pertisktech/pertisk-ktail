@@ -31,7 +31,20 @@ pub struct Controller {
     client: Client,
     options: ControllerOptions,
     callbacks: Callbacks,
-    tailers: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    tailers: Arc<RwLock<HashMap<String, TailerEntry>>>,
+    init_buffer: Arc<RwLock<Option<HashMap<String, TailerTarget>>>>,
+}
+
+struct TailerEntry {
+    handle: tokio::task::JoinHandle<()>,
+    pod: Arc<Pod>,
+    container: Arc<Container>,
+}
+
+#[derive(Clone)]
+struct TailerTarget {
+    pod: Arc<Pod>,
+    container: Arc<Container>,
 }
 
 impl Controller {
@@ -41,6 +54,7 @@ impl Controller {
             options,
             callbacks,
             tailers: Arc::new(RwLock::new(HashMap::new())),
+            init_buffer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -126,7 +140,15 @@ impl Controller {
                                         Event::Delete(pod) => {
                                             self_clone.on_delete(&Arc::new(pod)).await;
                                         }
-                                        _ => {}
+                                        Event::Init => {
+                                            self_clone.on_init().await;
+                                        }
+                                        Event::InitApply(pod) => {
+                                            self_clone.on_init_apply(&Arc::new(pod)).await;
+                                        }
+                                        Event::InitDone => {
+                                            self_clone.on_init_done().await;
+                                        }
                                     }
                                 }
                                 Some(Err(e)) => {
@@ -155,72 +177,85 @@ impl Controller {
     }
 
     async fn on_initial_add(&self, pod: &Arc<Pod>) -> bool {
-        let mut added = false;
+        let targets = self.matching_targets(pod);
+        let added = !targets.is_empty();
 
-        if let Some(spec) = &pod.spec {
-            if let Some(init_containers) = &spec.init_containers {
-                for container in init_containers {
-                    if self.should_include_container(pod, container) {
-                        self.add_container(pod, &Arc::new(container.clone()), true).await;
-                        added = true;
-                    }
-                }
-            }
-
-            for container in &spec.containers {
-                if self.should_include_container(pod, container) {
-                    self.add_container(pod, &Arc::new(container.clone()), true).await;
-                    added = true;
-                }
-            }
+        for target in targets {
+            self.add_container(&target.pod, &target.container, true).await;
         }
 
         added
     }
 
     async fn on_add(&self, pod: &Arc<Pod>) {
-        if let Some(spec) = &pod.spec {
-            if let Some(init_containers) = &spec.init_containers {
-                for container in init_containers {
-                    if self.should_include_container(pod, container) {
-                        self.add_container(pod, &Arc::new(container.clone()), false).await;
-                    }
-                }
-            }
-
-            for container in &spec.containers {
-                if self.should_include_container(pod, container) {
-                    self.add_container(pod, &Arc::new(container.clone()), false).await;
-                }
-            }
-        }
+        self.reconcile_pod_targets(pod, false).await;
     }
 
     async fn on_delete(&self, pod: &Arc<Pod>) {
-        if let Some(spec) = &pod.spec {
-            if let Some(init_containers) = &spec.init_containers {
-                for container in init_containers {
-                    let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
-                    let tailer_id = format!("{}/{}", pod_name, container.name);
-                    if let Some(handle) = self.tailers.write().await.remove(&tailer_id) {
-                        handle.abort();
-                    }
-                    (self.callbacks.on_exit)(pod, &Arc::new(container.clone()));
-                }
-            }
+        for target in self.remove_tailers_for_pod(pod).await {
+            (self.callbacks.on_exit)(&target.pod, &target.container);
+        }
+    }
 
-            for container in &spec.containers {
-                let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
-                let tailer_id = format!("{}/{}", pod_name, container.name);
-                if let Some(handle) = self.tailers.write().await.remove(&tailer_id) {
-                    handle.abort();
+    async fn on_init(&self) {
+        *self.init_buffer.write().await = Some(HashMap::new());
+    }
+
+    async fn on_init_apply(&self, pod: &Arc<Pod>) {
+        let targets = self.matching_targets(pod);
+        let mut init_buffer = self.init_buffer.write().await;
+        let buffer = init_buffer.get_or_insert_with(HashMap::new);
+        for target in targets {
+            buffer.insert(self.tailer_id(&target.pod, &target.container), target);
+        }
+    }
+
+    async fn on_init_done(&self) {
+        let desired = self
+            .init_buffer
+            .write()
+            .await
+            .take()
+            .unwrap_or_default();
+
+        let desired_ids = desired.keys().cloned().collect::<std::collections::HashSet<_>>();
+        let mut removed = Vec::new();
+
+        {
+            let mut tailers = self.tailers.write().await;
+            let stale_ids = tailers
+                .keys()
+                .filter(|tailer_id| !desired_ids.contains(*tailer_id))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            for tailer_id in stale_ids {
+                if let Some(entry) = tailers.remove(&tailer_id) {
+                    entry.handle.abort();
+                    removed.push(TailerTarget {
+                        pod: entry.pod,
+                        container: entry.container,
+                    });
                 }
-                (self.callbacks.on_exit)(pod, &Arc::new(container.clone()));
             }
+        }
+
+        for target in removed {
+            (self.callbacks.on_exit)(&target.pod, &target.container);
+        }
+
+        for target in desired.into_values() {
+            self.add_container(&target.pod, &target.container, false).await;
         }
     }
 
     fn should_include_container(&self, pod: &Pod, container: &Container) -> bool {
+        if !self.pod_allows_tailing(pod) {
+            return false;
+        }
+        if !self.container_has_known_status(pod, &container.name) {
+            return false;
+        }
         if !self.options.inclusion_matcher.matches_container(pod, container) {
             return false;
         }
@@ -230,10 +265,139 @@ impl Controller {
         true
     }
 
+    fn pod_allows_tailing(&self, pod: &Pod) -> bool {
+        matches!(
+            pod.status.as_ref().and_then(|status| status.phase.as_deref()),
+            Some("Running") | Some("Pending")
+        )
+    }
+
+    fn container_has_known_status(&self, pod: &Pod, container_name: &str) -> bool {
+        let Some(status) = &pod.status else {
+            return false;
+        };
+
+        status
+            .container_statuses
+            .iter()
+            .flatten()
+            .chain(status.init_container_statuses.iter().flatten())
+            .any(|container_status| {
+                let Some(state) = &container_status.state else {
+                    return false;
+                };
+                container_status.name == container_name
+                    && (state.running.is_some()
+                        || state.waiting.is_some()
+                        || state.terminated.is_some())
+            })
+    }
+
+    fn matching_targets(&self, pod: &Arc<Pod>) -> Vec<TailerTarget> {
+        let mut targets = Vec::new();
+
+        if let Some(spec) = &pod.spec {
+            if let Some(init_containers) = &spec.init_containers {
+                for container in init_containers {
+                    if self.should_include_container(pod, container) {
+                        targets.push(TailerTarget {
+                            pod: pod.clone(),
+                            container: Arc::new(container.clone()),
+                        });
+                    }
+                }
+            }
+
+            for container in &spec.containers {
+                if self.should_include_container(pod, container) {
+                    targets.push(TailerTarget {
+                        pod: pod.clone(),
+                        container: Arc::new(container.clone()),
+                    });
+                }
+            }
+        }
+
+        targets
+    }
+
+    fn tailer_id(&self, pod: &Arc<Pod>, container: &Arc<Container>) -> String {
+        let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+        format!("{}/{}", pod_name, container.name)
+    }
+
+    async fn remove_tailers_for_pod(&self, pod: &Arc<Pod>) -> Vec<TailerTarget> {
+        let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+        let mut removed = Vec::new();
+
+        let mut tailers = self.tailers.write().await;
+        let stale_ids = tailers
+            .iter()
+            .filter(|(_, entry)| {
+                entry.pod.metadata.name.as_deref().unwrap_or_default() == pod_name
+                    && entry.pod.metadata.namespace.as_deref().unwrap_or_default() == pod_namespace
+            })
+            .map(|(tailer_id, _)| tailer_id.clone())
+            .collect::<Vec<_>>();
+
+        for tailer_id in stale_ids {
+            if let Some(entry) = tailers.remove(&tailer_id) {
+                entry.handle.abort();
+                removed.push(TailerTarget {
+                    pod: entry.pod,
+                    container: entry.container,
+                });
+            }
+        }
+
+        removed
+    }
+
+    async fn reconcile_pod_targets(&self, pod: &Arc<Pod>, initial_add: bool) {
+        let desired_targets = self.matching_targets(pod);
+        let desired_ids = desired_targets
+            .iter()
+            .map(|target| self.tailer_id(&target.pod, &target.container))
+            .collect::<std::collections::HashSet<_>>();
+        let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+        let mut removed = Vec::new();
+
+        {
+            let mut tailers = self.tailers.write().await;
+            let stale_ids = tailers
+                .iter()
+                .filter(|(tailer_id, entry)| {
+                    entry.pod.metadata.name.as_deref().unwrap_or_default() == pod_name
+                        && entry.pod.metadata.namespace.as_deref().unwrap_or_default() == pod_namespace
+                        && !desired_ids.contains(*tailer_id)
+                })
+                .map(|(tailer_id, _)| tailer_id.clone())
+                .collect::<Vec<_>>();
+
+            for tailer_id in stale_ids {
+                if let Some(entry) = tailers.remove(&tailer_id) {
+                    entry.handle.abort();
+                    removed.push(TailerTarget {
+                        pod: entry.pod,
+                        container: entry.container,
+                    });
+                }
+            }
+        }
+
+        for target in removed {
+            (self.callbacks.on_exit)(&target.pod, &target.container);
+        }
+
+        for target in desired_targets {
+            self.add_container(&target.pod, &target.container, initial_add).await;
+        }
+    }
+
     async fn add_container(&self, pod: &Arc<Pod>, container: &Arc<Container>, initial_add: bool) {
-        let pod_name = pod.metadata.name.as_ref().map(|s| s.clone()).unwrap_or_default();
-        let container_name = container.name.clone();
-        let tailer_id = format!("{}/{}", pod_name, container_name);
+        let tailer_id = self.tailer_id(pod, container);
 
         // Keep callback+insert atomic under one lock to avoid duplicate starts from rapid Apply events.
         {
@@ -252,6 +416,7 @@ impl Controller {
             let container_clone = container.clone();
             let on_event = self.callbacks.on_event.clone();
             let on_error = self.callbacks.on_error.clone();
+            let on_exit = self.callbacks.on_exit.clone();
             let from_timestamp = self.options.since;
             let tailers_map = self.tailers.clone();
             let tailer_id_for_cleanup = tailer_id.clone();
@@ -274,11 +439,20 @@ impl Controller {
 
                 let _ = tailer.run(event_callback, error_callback).await;
 
+                on_exit(&pod_clone, &container_clone);
+
                 // Remove completed tailer so future pod/container instances can be tailed.
                 tailers_map.write().await.remove(&tailer_id_for_cleanup);
             });
 
-            tailers.insert(tailer_id, handle);
+            tailers.insert(
+                tailer_id,
+                TailerEntry {
+                    handle,
+                    pod: pod.clone(),
+                    container: container.clone(),
+                },
+            );
         }
     }
 }

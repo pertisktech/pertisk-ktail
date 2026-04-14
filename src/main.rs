@@ -3,6 +3,8 @@ use chrono::Duration;
 use clap::Parser;
 use k8s_openapi::api::core::v1::{Container, Pod};
 use kube::Client;
+use kube::Config as KubeConfig;
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use ktail::*;
 use ktail::matcher::{Matcher, RegexMatcher, LabelSelectorMatcher, OrMatcher};
 use std::collections::HashMap;
@@ -112,8 +114,24 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Config::load_default()?;
 
-    // Create Kubernetes client
-    let client = Client::try_default().await?;
+    // Create Kubernetes client, honouring --kubeconfig and --context flags.
+    let client = {
+        let kube_opts = KubeConfigOptions {
+            context: args.context.clone(),
+            cluster: None,
+            user: None,
+        };
+        let kube_config = if let Some(path) = &args.kubeconfig {
+            KubeConfig::from_custom_kubeconfig(
+                Kubeconfig::read_from(path)?,
+                &kube_opts,
+            )
+            .await?
+        } else {
+            KubeConfig::from_kubeconfig(&kube_opts).await?
+        };
+        Client::try_from(kube_config)?
+    };
 
     // Determine namespaces
     let namespaces = if args.all_namespaces {
@@ -191,6 +209,7 @@ async fn main() -> Result<()> {
 
     // Create callbacks
     let formatter_clone = std::sync::Arc::new(formatter);
+    let show_namespace = args.all_namespaces || namespaces.len() > 1 || namespaces.iter().any(|ns| ns == "*");
     let callbacks = Callbacks {
         on_event: Arc::new({
             let fmt = formatter_clone.clone();
@@ -200,22 +219,25 @@ async fn main() -> Result<()> {
         }),
         on_enter: Arc::new({
             let fmt = formatter_clone.clone();
+            let show_namespace = show_namespace;
             move |pod: &Arc<Pod>, container: &Arc<Container>, initial: bool| {
-                let pod_name = pod.metadata.name.as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or("unknown");
-                let action = if initial { "Discovered" } else { "Started" };
-                fmt.print_event_notification(pod_name, &container.name, action);
+                let pod_and_container = format_pod_and_container(pod, container, show_namespace);
+                let message = if initial {
+                    format!("Attached to container [{}]", pod_and_container)
+                } else {
+                    format!("New container [{}]", pod_and_container)
+                };
+                fmt.print_info(&message);
                 true
             }
         }),
         on_exit: Arc::new({
             let fmt = formatter_clone.clone();
+            let show_namespace = show_namespace;
             move |pod: &Arc<Pod>, container: &Arc<Container>| {
-                let pod_name = pod.metadata.name.as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or("unknown");
-                fmt.print_event_notification(pod_name, &container.name, "Stopped");
+                let pod_and_container = format_pod_and_container(pod, container, show_namespace);
+                let status = container_status_label(pod, &container.name);
+                fmt.print_info(&format!("Container left ({}) [{}]", status, pod_and_container));
             }
         }),
         on_error: Arc::new({
@@ -248,6 +270,53 @@ async fn main() -> Result<()> {
     controller.run(token).await?;
 
     Ok(())
+}
+
+fn format_pod_name(pod: &Pod, show_namespace: bool) -> String {
+    let pod_name = pod.metadata.name.as_deref().unwrap_or("unknown");
+    if show_namespace {
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        format!("{}/{}", namespace, pod_name)
+    } else {
+        pod_name.to_string()
+    }
+}
+
+fn format_pod_and_container(pod: &Pod, container: &Container, show_namespace: bool) -> String {
+    format!("{}:{}", format_pod_name(pod, show_namespace), container.name)
+}
+
+fn container_status_label(pod: &Pod, container_name: &str) -> &'static str {
+    let Some(status) = &pod.status else {
+        return "unknown";
+    };
+
+    for container_status in status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten())
+    {
+        if container_status.name != container_name {
+            continue;
+        }
+
+        let Some(state) = &container_status.state else {
+            return "unknown";
+        };
+
+        if state.running.is_some() {
+            return "running";
+        }
+        if state.waiting.is_some() {
+            return "waiting";
+        }
+        if state.terminated.is_some() {
+            return "terminated";
+        }
+    }
+
+    "unknown"
 }
 
 fn parse_label_selector(selector: &str) -> Result<HashMap<String, String>> {
