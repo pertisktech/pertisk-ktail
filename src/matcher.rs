@@ -31,8 +31,9 @@ impl Matcher for RegexMatcher {
         }
     }
 
-    fn matches_container(&self, _pod: &Pod, container: &Container) -> bool {
-        self.regex.is_match(&container.name)
+    fn matches_container(&self, pod: &Pod, container: &Container) -> bool {
+        // CLI patterns are documented as pod/container patterns, so allow either.
+        self.regex.is_match(&container.name) || self.matches_pod(pod)
     }
 }
 

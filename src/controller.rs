@@ -4,6 +4,7 @@ use k8s_openapi::api::core::v1::{Pod, Container};
 use kube::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use futures::StreamExt;
 use kube::runtime::watcher;
@@ -123,50 +124,108 @@ impl Controller {
             let token_clone = token.clone();
             let self_clone = self.clone();
             let namespace_clone = namespace.clone();
+            let api_for_watch = api.clone();
             
             let task = tokio::spawn(async move {
-                let mut stream = watcher(api, Default::default()).boxed();
+                let mut retry_count = 0u32;
+                loop {
+                    let mut stream = watcher(api_for_watch.clone(), Default::default()).boxed();
+                    let mut restart_requested = false;
+
+                    tokio::select! {
+                        _ = token_clone.cancelled() => break,
+                        _ = async {
+                            while let Some(result) = stream.next().await {
+                                match result {
+                                    Ok(event) => {
+                                        retry_count = 0;
+                                        use kube::runtime::watcher::Event;
+                                        match event {
+                                            Event::Apply(pod) => {
+                                                self_clone.on_add(&Arc::new(pod)).await;
+                                            }
+                                            Event::Delete(pod) => {
+                                                self_clone.on_delete(&Arc::new(pod)).await;
+                                            }
+                                            Event::Init => {
+                                                self_clone.on_init().await;
+                                            }
+                                            Event::InitApply(pod) => {
+                                                self_clone.on_init_apply(&Arc::new(pod)).await;
+                                            }
+                                            Event::InitDone => {
+                                                self_clone.on_init_done().await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let error_str = e.to_string();
+                                        if error_str.contains("forbidden") || error_str.contains("Forbidden") || error_str.contains("403") {
+                                            eprintln!("Permission denied for namespace '{}' - stopping watch", namespace_clone);
+                                            return;
+                                        }
+
+                                        eprintln!("Watcher error in namespace '{}': {}", namespace_clone, e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Stream ended unexpectedly; request restart.
+                            restart_requested = true;
+                        } => {}
+                    }
+
+                    if token_clone.is_cancelled() {
+                        break;
+                    }
+
+                    if restart_requested {
+                        // Exponential backoff (max 30s) avoids hot-looping on repeated watch failures.
+                        let backoff_secs = (1u64 << retry_count.min(4)).min(30);
+                        retry_count = retry_count.saturating_add(1);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            });
+            watch_tasks.push(task);
+
+            // Fallback reconciliation loop: if watch events are missed, periodic listing
+            // still discovers new pods and starts missing tailers.
+            let token_clone = token.clone();
+            let self_clone = self.clone();
+            let namespace_clone = namespace.clone();
+            let api_for_fallback = api.clone();
+            let fallback_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     tokio::select! {
                         _ = token_clone.cancelled() => break,
-                        result = stream.next() => {
-                            match result {
-                                Some(Ok(event)) => {
-                                    use kube::runtime::watcher::Event;
-                                    match event {
-                                        Event::Apply(pod) => {
-                                            self_clone.on_add(&Arc::new(pod)).await;
-                                        }
-                                        Event::Delete(pod) => {
-                                            self_clone.on_delete(&Arc::new(pod)).await;
-                                        }
-                                        Event::Init => {
-                                            self_clone.on_init().await;
-                                        }
-                                        Event::InitApply(pod) => {
-                                            self_clone.on_init_apply(&Arc::new(pod)).await;
-                                        }
-                                        Event::InitDone => {
-                                            self_clone.on_init_done().await;
-                                        }
+                        _ = interval.tick() => {
+                            match api_for_fallback.list(&Default::default()).await {
+                                Ok(pod_list) => {
+                                    for pod in pod_list.items {
+                                        self_clone.on_add(&Arc::new(pod)).await;
                                     }
                                 }
-                                Some(Err(e)) => {
+                                Err(e) => {
                                     let error_str = e.to_string();
                                     if error_str.contains("forbidden") || error_str.contains("Forbidden") || error_str.contains("403") {
-                                        eprintln!("Permission denied for namespace '{}' - stopping watch", namespace_clone);
+                                        eprintln!("Permission denied for namespace '{}' - stopping fallback reconcile", namespace_clone);
                                         break;
                                     } else {
-                                        eprintln!("Watcher error in namespace '{}': {}", namespace_clone, e);
+                                        eprintln!("Fallback reconcile error in namespace '{}': {}", namespace_clone, e);
                                     }
                                 }
-                                None => break,
                             }
                         }
                     }
                 }
             });
-            watch_tasks.push(task);
+            watch_tasks.push(fallback_task);
         }
 
         // Wait for cancellation signal instead of waiting for watch tasks to complete
@@ -253,9 +312,6 @@ impl Controller {
         if !self.pod_allows_tailing(pod) {
             return false;
         }
-        if !self.container_has_known_status(pod, &container.name) {
-            return false;
-        }
         if !self.options.inclusion_matcher.matches_container(pod, container) {
             return false;
         }
@@ -270,27 +326,6 @@ impl Controller {
             pod.status.as_ref().and_then(|status| status.phase.as_deref()),
             Some("Running") | Some("Pending")
         )
-    }
-
-    fn container_has_known_status(&self, pod: &Pod, container_name: &str) -> bool {
-        let Some(status) = &pod.status else {
-            return false;
-        };
-
-        status
-            .container_statuses
-            .iter()
-            .flatten()
-            .chain(status.init_container_statuses.iter().flatten())
-            .any(|container_status| {
-                let Some(state) = &container_status.state else {
-                    return false;
-                };
-                container_status.name == container_name
-                    && (state.running.is_some()
-                        || state.waiting.is_some()
-                        || state.terminated.is_some())
-            })
     }
 
     fn matching_targets(&self, pod: &Arc<Pod>) -> Vec<TailerTarget> {
@@ -322,21 +357,36 @@ impl Controller {
     }
 
     fn tailer_id(&self, pod: &Arc<Pod>, container: &Arc<Container>) -> String {
-        let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
-        format!("{}/{}", pod_name, container.name)
+        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+        let pod_identity = pod
+            .metadata
+            .uid
+            .as_deref()
+            .or(pod.metadata.name.as_deref())
+            .unwrap_or_default();
+        format!("{}/{}/{}", pod_namespace, pod_identity, container.name)
+    }
+
+    fn pod_instance_id(&self, pod: &Pod) -> (String, String) {
+        let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+        let identity = pod
+            .metadata
+            .uid
+            .clone()
+            .or(pod.metadata.name.clone())
+            .unwrap_or_default();
+        (namespace, identity)
     }
 
     async fn remove_tailers_for_pod(&self, pod: &Arc<Pod>) -> Vec<TailerTarget> {
-        let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
-        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+        let pod_instance = self.pod_instance_id(pod);
         let mut removed = Vec::new();
 
         let mut tailers = self.tailers.write().await;
         let stale_ids = tailers
             .iter()
             .filter(|(_, entry)| {
-                entry.pod.metadata.name.as_deref().unwrap_or_default() == pod_name
-                    && entry.pod.metadata.namespace.as_deref().unwrap_or_default() == pod_namespace
+                self.pod_instance_id(&entry.pod) == pod_instance
             })
             .map(|(tailer_id, _)| tailer_id.clone())
             .collect::<Vec<_>>();
@@ -360,8 +410,7 @@ impl Controller {
             .iter()
             .map(|target| self.tailer_id(&target.pod, &target.container))
             .collect::<std::collections::HashSet<_>>();
-        let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
-        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+        let pod_instance = self.pod_instance_id(pod);
         let mut removed = Vec::new();
 
         {
@@ -369,8 +418,7 @@ impl Controller {
             let stale_ids = tailers
                 .iter()
                 .filter(|(tailer_id, entry)| {
-                    entry.pod.metadata.name.as_deref().unwrap_or_default() == pod_name
-                        && entry.pod.metadata.namespace.as_deref().unwrap_or_default() == pod_namespace
+                    self.pod_instance_id(&entry.pod) == pod_instance
                         && !desired_ids.contains(*tailer_id)
                 })
                 .map(|(tailer_id, _)| tailer_id.clone())

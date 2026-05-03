@@ -220,13 +220,9 @@ async fn main() -> Result<()> {
         on_enter: Arc::new({
             let fmt = formatter_clone.clone();
             let show_namespace = show_namespace;
-            move |pod: &Arc<Pod>, container: &Arc<Container>, initial: bool| {
+            move |pod: &Arc<Pod>, container: &Arc<Container>, _initial: bool| {
                 let pod_and_container = format_pod_and_container(pod, container, show_namespace);
-                let message = if initial {
-                    format!("Attached to container [{}]", pod_and_container)
-                } else {
-                    format!("New container [{}]", pod_and_container)
-                };
+                let message = format!("Attached to container [{}]", pod_and_container);
                 fmt.print_info(&message);
                 true
             }
